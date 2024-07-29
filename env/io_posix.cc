@@ -40,6 +40,17 @@
 #include "util/autovector.h"
 #include "util/coding.h"
 #include "util/string_util.h"
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <mutex>
+
+
+
 
 #if defined(OS_LINUX) && !defined(F_SET_RW_HINT)
 #define F_LINUX_SPECIFIC_BASE 1024
@@ -55,6 +66,45 @@ std::string IOErrorMsg(const std::string& context,
   }
   return context + ": " + file_name;
 }
+
+class PosixLogger {
+public:
+    PosixLogger() : log_file_path_("/concord/rocksdbdata/posix.log") {
+        log_file_.open(log_file_path_, std::ios::app);
+        if (!log_file_.is_open()) {
+            throw std::runtime_error("Unable to open log file: " + log_file_path_);
+        }
+    }
+
+    ~PosixLogger() {
+        if (log_file_.is_open()) {
+            log_file_.close();
+        }
+    }
+
+    void log(const std::string& message) {
+        auto now = std::chrono::system_clock::now();
+        auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
+        auto milliseconds = now_ms.time_since_epoch() % 1000;
+
+        std::tm now_tm = *std::localtime(&now_time_t);
+        
+        std::ostringstream oss;
+        oss << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << '.' << std::setw(3) << std::setfill('0') << milliseconds.count();
+        oss << " [Thread ID: " << std::this_thread::get_id() << "] " << message;
+
+        log_file_ << oss.str();
+        log_file_.flush();
+    }
+
+private:
+    std::string log_file_path_;
+    std::ofstream log_file_;
+    std::mutex log_mutex_;
+};
+
+PosixLogger logger;
 
 // file_name can be left empty if it is not unkown.
 IOStatus IOError(const std::string& context, const std::string& file_name,
@@ -113,36 +163,84 @@ namespace {
 
 bool PosixWrite(int fd, const char* buf, size_t nbyte) {
   const size_t kLimit1Gb = 1UL << 30;
-  //E.L add measure here
+  
+  auto start_time = std::chrono::high_resolution_clock::now();
+  auto start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(start_time.time_since_epoch()).count();
+  {
+    std::ostringstream oss;
+    oss << "PosixWrite - Start time: " << start_time_us << " us , fd " << fd << " size bytes " << nbyte << std::endl;
+    logger.log(oss.str());
+  }
+  
   const char* src = buf;
   size_t left = nbyte;
+  bool success = true;
 
   while (left != 0) {
+    auto write_start = std::chrono::high_resolution_clock::now();
     size_t bytes_to_write = std::min(left, kLimit1Gb);
 
     ssize_t done = write(fd, src, bytes_to_write);
+    auto write_end = std::chrono::high_resolution_clock::now();
+
+    auto write_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(write_end - write_start).count();
+    {
+      std::ostringstream oss;
+      oss << "PosixWrite - Write time: " << write_duration_us << " us, bytes_to_write " <<  bytes_to_write << " wrote " <<done << " fd " << fd <<std::endl;
+      logger.log(oss.str());
+    }
+
     if (done < 0) {
       if (errno == EINTR) {
         continue;
       }
-      return false;
+      success = false;
+      break;
     }
     left -= done;
     src += done;
   }
-  return true;
-}
 
+  auto end_time = std::chrono::high_resolution_clock::now();
+  auto total_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+  {
+      std::ostringstream oss;
+      oss << "PosixWrite - Total operation time: " << total_duration_us << " us, fd " << fd << std::endl;
+      logger.log(oss.str());
+  }
+
+
+  return success;
+}
 bool PosixPositionedWrite(int fd, const char* buf, size_t nbyte, off_t offset) {
   const size_t kLimit1Gb = 1UL << 30;
+
+  auto start_time = std::chrono::high_resolution_clock::now();
+  auto start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(start_time.time_since_epoch()).count();
+  {
+    std::ostringstream oss;
+    oss << "PosixPositionedWrite - Start time: " << start_time_us << " us , fd " << fd << " size bytes " << nbyte << std::endl;
+    logger.log(oss.str());
+  }
 
   const char* src = buf;
   size_t left = nbyte;
 
   while (left != 0) {
+    auto write_start = std::chrono::high_resolution_clock::now();
     size_t bytes_to_write = std::min(left, kLimit1Gb);
 
     ssize_t done = pwrite(fd, src, bytes_to_write, offset);
+
+    auto write_end = std::chrono::high_resolution_clock::now();
+
+    auto write_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(write_end - write_start).count();
+    {
+      std::ostringstream oss;
+      oss << "PosixPositionedWrite Write time: " << write_duration_us << " us, bytes_to_write " <<  bytes_to_write << " wrote " <<done << " fd " << fd <<std::endl;
+      logger.log(oss.str());
+    }
+
     if (done < 0) {
       if (errno == EINTR) {
         continue;
@@ -152,6 +250,14 @@ bool PosixPositionedWrite(int fd, const char* buf, size_t nbyte, off_t offset) {
     left -= done;
     offset += done;
     src += done;
+  }
+
+  auto end_time = std::chrono::high_resolution_clock::now();
+  auto total_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+  {
+      std::ostringstream oss;
+      oss << "PosixPositionedWrite Total operation time: " << total_duration_us << " us, fd " << fd << std::endl;
+      logger.log(oss.str());
   }
 
   return true;
