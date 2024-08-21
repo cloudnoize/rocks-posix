@@ -24,7 +24,61 @@
 #include "util/random.h"
 #include "util/rate_limiter_impl.h"
 
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <mutex>
+
+
 namespace ROCKSDB_NAMESPACE {
+
+
+
+  class WriterFileLogger {
+public:
+    WriterFileLogger() : log_file_path_("/concord/rocksdbdata/writable_file.log") {
+        log_file_.open(log_file_path_, std::ios::app);
+        if (!log_file_.is_open()) {
+            throw std::runtime_error("Unable to open log file: " + log_file_path_);
+        }
+    }
+
+    ~WriterFileLogger() {
+        if (log_file_.is_open()) {
+            log_file_.close();
+        }
+    }
+
+    void log(const std::string& message) {
+        auto now = std::chrono::system_clock::now();
+        auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
+        auto milliseconds = now_ms.time_since_epoch() % 1000;
+
+        std::tm now_tm = *std::localtime(&now_time_t);
+        
+        std::ostringstream oss;
+        oss << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << '.' << std::setw(3) << std::setfill('0') << milliseconds.count();
+        oss << " [Thread ID: " << std::this_thread::get_id() << "] " << message << std::endl;
+
+        log_file_ << oss.str();
+        log_file_.flush();
+    }
+
+private:
+    std::string log_file_path_;
+    std::ofstream log_file_;
+    std::mutex log_mutex_;
+};
+
+WriterFileLogger file_logger;
+
+
+
 inline Histograms GetFileWriteHistograms(Histograms file_writer_hist,
                                          Env::IOActivity io_activity) {
   if (file_writer_hist == Histograms::SST_WRITE_MICROS ||
@@ -455,21 +509,24 @@ IOStatus WritableFileWriter::Sync(const IOOptions& opts, bool use_fsync) {
   if (seen_error()) {
     return AssertFalseAndGetStatusForPrevError();
   }
-
+  file_logger.log(std::string("Sync 1"));
   IOOptions io_options = FinalizeIOOptions(opts);
   IOStatus s = Flush(io_options);
   if (!s.ok()) {
     set_seen_error();
     return s;
   }
+  file_logger.log(std::string("Sync 2"));
   TEST_KILL_RANDOM("WritableFileWriter::Sync:0");
   if (!use_direct_io() && pending_sync_) {
+    file_logger.log(std::string("SyncInternal 1"));
     s = SyncInternal(io_options, use_fsync);
     if (!s.ok()) {
       set_seen_error();
       return s;
     }
   }
+  file_logger.log(std::string("Sync 3"));
   TEST_KILL_RANDOM("WritableFileWriter::Sync:1");
   pending_sync_ = false;
   return IOStatus::OK();
@@ -507,17 +564,20 @@ IOStatus WritableFileWriter::SyncInternal(const IOOptions& opts,
   auto prev_perf_level = GetPerfLevel();
 
   IOSTATS_CPU_TIMER_GUARD(cpu_write_nanos, clock_);
-
+  file_logger.log(std::string("SyncInternal 1"));
   FileOperationInfo::StartTimePoint start_ts;
   if (ShouldNotifyListeners()) {
     start_ts = FileOperationInfo::StartNow();
   }
-
+  file_logger.log(std::string("SyncInternal 2"));
   if (use_fsync) {
+    file_logger.log(std::string("SyncInternal Fsync"));
     s = writable_file_->Fsync(opts, nullptr);
   } else {
+    file_logger.log(std::string("SyncInternal Sync"));
     s = writable_file_->Sync(opts, nullptr);
   }
+  file_logger.log(std::string("SyncInternal 3"));
   if (ShouldNotifyListeners()) {
     auto finish_ts = std::chrono::steady_clock::now();
     NotifyOnFileSyncFinish(

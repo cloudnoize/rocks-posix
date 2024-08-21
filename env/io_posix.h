@@ -45,6 +45,13 @@
 #endif
 
 namespace ROCKSDB_NAMESPACE {
+
+  
+
+struct PosixLoggger{
+  static std::shared_ptr<Logger> posix_info_log;
+};
+
 std::string IOErrorMsg(const std::string& context,
                        const std::string& file_name);
 // file_name can be left empty if it is not unkown.
@@ -161,6 +168,8 @@ inline void UpdateResult(struct io_uring_cqe* cqe, const std::string& file_name,
 #endif
 
 #ifdef OS_LINUX
+
+
 // Files under a specific directory have the same logical block size.
 // This class caches the logical block size for the specified directories to
 // save the CPU cost of computing the size.

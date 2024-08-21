@@ -168,7 +168,7 @@ bool PosixWrite(int fd, const char* buf, size_t nbyte) {
   auto start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(start_time.time_since_epoch()).count();
   {
     std::ostringstream oss;
-    oss << "PosixWrite - Start time: " << start_time_us << " us , fd " << fd << " size bytes " << nbyte << std::endl;
+    oss << "1 PosixWrite - Start time: " << start_time_us << " us , fd " << fd << " size bytes " << nbyte << std::endl;
     logger.log(oss.str());
   }
   
@@ -1292,17 +1292,32 @@ IOStatus PosixMmapFile::Flush(const IOOptions& /*opts*/,
 
 IOStatus PosixMmapFile::Sync(const IOOptions& /*opts*/,
                              IODebugContext* /*dbg*/) {
+{std::ostringstream oss;
+oss << "Sync 1 " <<std::endl;
+  logger.log(oss.str());}
 #ifdef HAVE_FULLFSYNC
+{std::ostringstream oss;
+  oss << "Sync 2 " <<std::endl;
+  logger.log(oss.str());}
   if (::fcntl(fd_, F_FULLFSYNC) < 0) {
     return IOError("while fcntl(F_FULLSYNC) mmapped file", filename_, errno);
   }
 #else   // HAVE_FULLFSYNC
+{std::ostringstream oss;
+  oss << "Sync 3 " <<std::endl;
+  logger.log(oss.str());}
   if (fdatasync(fd_) < 0) {
     return IOError("While fdatasync mmapped file", filename_, errno);
   }
 #endif  // HAVE_FULLFSYNC
-
-  return Msync();
+{std::ostringstream oss;
+  oss << "Sync 4 " <<std::endl;
+  logger.log(oss.str());}
+  auto stat = Msync();
+  {std::ostringstream oss;
+  oss << "Sync end " <<std::endl;
+  logger.log(oss.str());}
+  return stat;
 }
 
 /**
@@ -1511,13 +1526,23 @@ IOStatus PosixWritableFile::Flush(const IOOptions& /*opts*/,
 IOStatus PosixWritableFile::Sync(const IOOptions& /*opts*/,
                                  IODebugContext* /*dbg*/) {
 #ifdef HAVE_FULLFSYNC
+{std::ostringstream oss;
+oss << "PosixWritableFile Sync fcntl " <<std::endl;
+  logger.log(oss.str());}
   if (::fcntl(fd_, F_FULLFSYNC) < 0) {
     return IOError("while fcntl(F_FULLFSYNC)", filename_, errno);
   }
 #else   // HAVE_FULLFSYNC
+{std::ostringstream oss;
+oss << "PosixWritableFile Sync fdatasync " <<std::endl;
+  logger.log(oss.str());}
   if (fdatasync(fd_) < 0) {
     return IOError("While fdatasync", filename_, errno);
   }
+
+  {std::ostringstream oss;
+oss << "PosixWritableFile Sync end " <<std::endl;
+  logger.log(oss.str());}
 #endif  // HAVE_FULLFSYNC
   return IOStatus::OK();
 }

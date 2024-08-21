@@ -17,7 +17,58 @@
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
 
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <mutex>
+
+
 namespace ROCKSDB_NAMESPACE {
+
+  class WriterLogger {
+public:
+    WriterLogger() : log_file_path_("/concord/rocksdbdata/write.log") {
+        log_file_.open(log_file_path_, std::ios::app);
+        if (!log_file_.is_open()) {
+            throw std::runtime_error("Unable to open log file: " + log_file_path_);
+        }
+    }
+
+    ~WriterLogger() {
+        if (log_file_.is_open()) {
+            log_file_.close();
+        }
+    }
+
+    void log(const std::string& message) {
+        auto now = std::chrono::system_clock::now();
+        auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
+        auto milliseconds = now_ms.time_since_epoch() % 1000;
+
+        std::tm now_tm = *std::localtime(&now_time_t);
+        
+        std::ostringstream oss;
+        oss << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << '.' << std::setw(3) << std::setfill('0') << milliseconds.count();
+        oss << " [Thread ID: " << std::this_thread::get_id() << "] " << message << std::endl;
+
+        log_file_ << oss.str();
+        log_file_.flush();
+    }
+
+private:
+    std::string log_file_path_;
+    std::ofstream log_file_;
+    std::mutex log_mutex_;
+};
+
+WriterLogger writer_logger;
+
+
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
                    const Slice& key, const Slice& val) {
@@ -189,6 +240,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
          write_options.protection_bytes_per_key == 0 ||
          write_options.protection_bytes_per_key ==
              my_batch->GetProtectionBytesPerKey());
+  writer_logger.log(std::string("WriteImpl start"));
   if (my_batch == nullptr) {
     return Status::InvalidArgument("Batch is nullptr!");
   } else if (!disable_memtable &&
@@ -221,6 +273,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     return Status::InvalidArgument(
         "`WriteOptions::protection_bytes_per_key` must be zero or eight");
   }
+  writer_logger.log(std::string("WriteImpl start 2"));
   // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
   // grabs but does not seem thread-safe.
   if (tracer_) {
@@ -262,7 +315,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   // Otherwise IsLatestPersistentState optimization does not make sense
   assert(!WriteBatchInternal::IsLatestPersistentState(my_batch) ||
          disable_memtable);
-
+  writer_logger.log(std::string("WriteImpl start 3"));
   if (write_options.low_pri) {
     Status s = ThrottleLowPriWritesIfNeeded(write_options, my_batch);
     if (!s.ok()) {
@@ -280,7 +333,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                             pre_release_callback, assign_order,
                             kDontPublishLastSeq, disable_memtable);
   }
-
+  writer_logger.log(std::string("WriteImpl start 4"));
   if (immutable_db_options_.unordered_write) {
     const size_t sub_batch_cnt = batch_cnt != 0
                                      ? batch_cnt
@@ -307,10 +360,11 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     }
     return status;
   }
-
+  writer_logger.log(std::string("WriteImpl start 5"));
   if (immutable_db_options_.enable_pipelined_write) {
     return PipelinedWriteImpl(write_options, my_batch, callback, log_used,
                               log_ref, disable_memtable, seq_used);
+    writer_logger.log(std::string("WriteImpl start 6"));
   }
 
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
@@ -318,8 +372,10 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                         disable_memtable, batch_cnt, pre_release_callback,
                         post_memtable_callback);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
-
+  writer_logger.log(std::string("WriteImpl start JoinBatchGroup"));
   write_thread_.JoinBatchGroup(&w);
+  writer_logger.log(std::string("WriteImpl end JoinBatchGroup"));
+
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {
     // we are a non-leader in a parallel group
 
@@ -676,26 +732,32 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
   WriteContext write_context;
-
+  writer_logger.log(std::string("PipelinedWriteImpl 1"));
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
                         disable_memtable, /*_batch_cnt=*/0,
                         /*_pre_release_callback=*/nullptr);
+  writer_logger.log(std::string("PipelinedWriteImpl 2"));
   write_thread_.JoinBatchGroup(&w);
+  writer_logger.log(std::string("PipelinedWriteImpl 3"));
   TEST_SYNC_POINT("DBImplWrite::PipelinedWriteImpl:AfterJoinBatchGroup");
   if (w.state == WriteThread::STATE_GROUP_LEADER) {
     WriteThread::WriteGroup wal_write_group;
+    writer_logger.log(std::string("PipelinedWriteImpl STATE_GROUP_LEADER 1"));
     if (w.callback && !w.callback->AllowWriteBatching()) {
       write_thread_.WaitForMemTableWriters();
     }
+    writer_logger.log(std::string("PipelinedWriteImpl STATE_GROUP_LEADER 2"));
     LogContext log_context(!write_options.disableWAL && write_options.sync);
     // PreprocessWrite does its own perf timing.
     PERF_TIMER_STOP(write_pre_and_post_process_time);
     w.status = PreprocessWrite(write_options, &log_context, &write_context);
+    writer_logger.log(std::string("PipelinedWriteImpl STATE_GROUP_LEADER 3"));
     PERF_TIMER_START(write_pre_and_post_process_time);
 
     // This can set non-OK status if callback fail.
     last_batch_group_size_ =
         write_thread_.EnterAsBatchGroupLeader(&w, &wal_write_group);
+    writer_logger.log(std::string("PipelinedWriteImpl STATE_GROUP_LEADER 4"));
     const SequenceNumber current_sequence =
         write_thread_.UpdateLastSequence(versions_->LastSequence()) + 1;
     size_t total_count = 0;
@@ -713,6 +775,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
           }
         }
       }
+      writer_logger.log(std::string("PipelinedWriteImpl STATE_GROUP_LEADER 5"));
       SequenceNumber next_sequence = current_sequence;
       for (auto* writer : wal_write_group) {
         assert(writer);
@@ -730,9 +793,10 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       if (w.disable_wal) {
         has_unpersisted_data_.store(true, std::memory_order_relaxed);
       }
+      writer_logger.log(std::string("PipelinedWriteImpl STATE_GROUP_LEADER 7"));
       write_thread_.UpdateLastSequence(current_sequence + total_count - 1);
     }
-
+    writer_logger.log(std::string("PipelinedWriteImpl 4"));
     auto stats = default_cf_internal_stats_;
     stats->AddDBStats(InternalStats::kIntStatsNumKeysWritten, total_count);
     RecordTick(stats_, NUMBER_KEYS_WRITTEN, total_count);
@@ -744,7 +808,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
 
     IOStatus io_s;
     io_s.PermitUncheckedError();  // Allow io_s to be uninitialized
-
+    writer_logger.log(std::string("PipelinedWriteImpl 5"));
     if (w.status.ok() && !write_options.disableWAL) {
       PERF_TIMER_GUARD(write_wal_time);
       stats->AddDBStats(InternalStats::kIntStatsWriteDoneBySelf, 1);
@@ -757,10 +821,12 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       assert(log_context.log_file_number_size);
       LogFileNumberSize& log_file_number_size =
           *(log_context.log_file_number_size);
+      writer_logger.log(std::string("PipelinedWriteImpl WriteToWAL start"));
       io_s =
           WriteToWAL(wal_write_group, log_context.writer, log_used,
                      log_context.need_log_sync, log_context.need_log_dir_sync,
                      current_sequence, log_file_number_size);
+      writer_logger.log(std::string("PipelinedWriteImpl WriteToWAL end"));
       w.status = io_s;
     }
 
@@ -770,7 +836,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     } else if (!w.CallbackFailed()) {
       WriteStatusCheck(w.status);
     }
-
+    writer_logger.log(std::string("PipelinedWriteImpl 6"));
     VersionEdit synced_wals;
     if (log_context.need_log_sync) {
       InstrumentedMutexLock l(&log_write_mutex_);
@@ -789,7 +855,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     }
     write_thread_.ExitAsBatchGroupLeader(wal_write_group, w.status);
   }
-
+  writer_logger.log(std::string("PipelinedWriteImpl 7"));
   // NOTE: the memtable_write_group is declared before the following
   // `if` statement because its lifetime needs to be longer
   // that the inner context  of the `if` as a reference to it
@@ -799,6 +865,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
   if (w.state == WriteThread::STATE_MEMTABLE_WRITER_LEADER) {
     PERF_TIMER_GUARD(write_memtable_time);
     assert(w.ShouldWriteToMemtable());
+    writer_logger.log(std::string("PipelinedWriteImpl STATE_MEMTABLE_WRITER_LEADER 1"));
     write_thread_.EnterAsMemTableWriter(&w, &memtable_write_group);
     if (memtable_write_group.size > 1 &&
         immutable_db_options_.allow_concurrent_memtable_write) {
@@ -812,13 +879,15 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
       versions_->SetLastSequence(memtable_write_group.last_sequence);
       write_thread_.ExitAsMemTableWriter(&w, memtable_write_group);
     }
+     writer_logger.log(std::string("PipelinedWriteImpl STATE_MEMTABLE_WRITER_LEADER 2"));
   } else {
     // NOTE: the memtable_write_group is never really used,
     // so we need to set its status to pass ASSERT_STATUS_CHECKED
     memtable_write_group.status.PermitUncheckedError();
   }
-
+  writer_logger.log(std::string("PipelinedWriteImpl 8"));
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {
+    writer_logger.log(std::string("PipelinedWriteImpl STATE_PARALLEL_MEMTABLE_WRITER 1"));
     assert(w.ShouldWriteToMemtable());
     ColumnFamilyMemTablesImpl column_family_memtables(
         versions_->GetColumnFamilySet());
@@ -828,16 +897,18 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
         0 /*log_number*/, this, true /*concurrent_memtable_writes*/,
         false /*seq_per_batch*/, 0 /*batch_cnt*/, true /*batch_per_txn*/,
         write_options.memtable_insert_hint_per_batch);
+    writer_logger.log(std::string("PipelinedWriteImpl STATE_PARALLEL_MEMTABLE_WRITER 2"));
     if (write_thread_.CompleteParallelMemTableWriter(&w)) {
       MemTableInsertStatusCheck(w.status);
       versions_->SetLastSequence(w.write_group->last_sequence);
       write_thread_.ExitAsMemTableWriter(&w, *w.write_group);
+      writer_logger.log(std::string("PipelinedWriteImpl STATE_PARALLEL_MEMTABLE_WRITER 3"));
     }
   }
   if (seq_used != nullptr) {
     *seq_used = w.sequence;
   }
-
+  writer_logger.log(std::string("PipelinedWriteImpl END"));
   assert(w.state == WriteThread::STATE_COMPLETED);
   return w.FinalStatus();
 }
@@ -1323,7 +1394,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             uint64_t* log_size,
                             LogFileNumberSize& log_file_number_size) {
   assert(log_size != nullptr);
-
+  writer_logger.log(std::string("WriteToWAL internal 1"));
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:log_entry", &log_entry);
   auto s = merged_batch.VerifyChecksum();
@@ -1339,16 +1410,19 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   // Due to performance cocerns of missed branch prediction penalize the new
   // manual_wal_flush_ feature (by UNLIKELY) instead of the more common case
   // when we do not need any locking.
+  writer_logger.log(std::string("WriteToWAL internal 2"));
   if (UNLIKELY(needs_locking)) {
     log_write_mutex_.Lock();
   }
+  writer_logger.log(std::string("WriteToWAL internal 3"));
   IOStatus io_s = log_writer->MaybeAddUserDefinedTimestampSizeRecord(
       write_options, versions_->GetColumnFamiliesTimestampSizeForRecord());
+  writer_logger.log(std::string("WriteToWAL internal 4"));
   if (!io_s.ok()) {
     return io_s;
   }
   io_s = log_writer->AddRecord(write_options, log_entry);
-
+  writer_logger.log(std::string("WriteToWAL internal 5"));
   if (UNLIKELY(needs_locking)) {
     log_write_mutex_.Unlock();
   }
@@ -1358,6 +1432,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   total_log_size_ += log_entry.size();
   log_file_number_size.AddSize(*log_size);
   log_empty_ = false;
+  writer_logger.log(std::string("WriteToWAL internal 6"));
   return io_s;
 }
 
@@ -1373,12 +1448,13 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   size_t write_with_wal = 0;
   WriteBatch* to_be_cached_state = nullptr;
   WriteBatch* merged_batch;
+  writer_logger.log(std::string("WriteToWAL 1"));
   io_s = status_to_io_status(MergeBatch(write_group, &tmp_batch_, &merged_batch,
                                         &write_with_wal, &to_be_cached_state));
   if (UNLIKELY(!io_s.ok())) {
     return io_s;
   }
-
+  writer_logger.log(std::string("WriteToWAL 2"));
   if (merged_batch == write_group.leader->batch) {
     write_group.leader->log_used = logfile_number_;
   } else if (write_with_wal > 1) {
@@ -1388,7 +1464,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   }
 
   WriteBatchInternal::SetSequence(merged_batch, sequence);
-
+  writer_logger.log(std::string("WriteToWAL 3"));
   uint64_t log_size;
 
   // TODO: plumb Env::IOActivity, Env::IOPriority
@@ -1401,7 +1477,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
   }
-
+  writer_logger.log(std::string("WriteToWAL 4"));
   if (io_s.ok() && need_log_sync) {
     StopWatch sw(immutable_db_options_.clock, stats_, WAL_FILE_SYNC_MICROS);
     // It's safe to access logs_ with unlocked mutex_ here because:
@@ -1422,7 +1498,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
     if (UNLIKELY(needs_locking)) {
       log_write_mutex_.Lock();
     }
-
+    writer_logger.log(std::string("WriteToWAL 5"));
     if (io_s.ok()) {
       for (auto& log : logs_) {
         IOOptions opts;
@@ -1430,13 +1506,15 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
         if (!io_s.ok()) {
           break;
         }
+        writer_logger.log(std::string("WriteToWAL Sync 1"));
         io_s = log.writer->file()->Sync(opts, immutable_db_options_.use_fsync);
+        writer_logger.log(std::string("WriteToWAL Sync 2"));
         if (!io_s.ok()) {
           break;
         }
       }
     }
-
+    writer_logger.log(std::string("WriteToWAL 6"));
     if (UNLIKELY(needs_locking)) {
       log_write_mutex_.Unlock();
     }
@@ -1448,12 +1526,14 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
       io_s = directories_.GetWalDir()->FsyncWithDirOptions(
           IOOptions(), nullptr,
           DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+      writer_logger.log(std::string("WriteToWAL 7"));
     }
   }
 
   if (merged_batch == &tmp_batch_) {
     tmp_batch_.Clear();
   }
+  writer_logger.log(std::string("WriteToWAL 8"));
   if (io_s.ok()) {
     auto stats = default_cf_internal_stats_;
     if (need_log_sync) {
@@ -1465,6 +1545,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
     stats->AddDBStats(InternalStats::kIntStatsWriteWithWal, write_with_wal);
     RecordTick(stats_, WRITE_WITH_WAL, write_with_wal);
   }
+  writer_logger.log(std::string("WriteToWAL 9"));
   return io_s;
 }
 

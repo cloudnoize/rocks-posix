@@ -14,7 +14,56 @@
 #include "test_util/sync_point.h"
 #include "util/random.h"
 
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <mutex>
+
 namespace ROCKSDB_NAMESPACE {
+
+  class WriterThreadLogger {
+public:
+    WriterThreadLogger() : log_file_path_("/concord/rocksdbdata/write_thread.log") {
+        log_file_.open(log_file_path_, std::ios::app);
+        if (!log_file_.is_open()) {
+            throw std::runtime_error("Unable to open log file: " + log_file_path_);
+        }
+    }
+
+    ~WriterThreadLogger() {
+        if (log_file_.is_open()) {
+            log_file_.close();
+        }
+    }
+
+    void log(const std::string& message) {
+        auto now = std::chrono::system_clock::now();
+        auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
+        auto milliseconds = now_ms.time_since_epoch() % 1000;
+
+        std::tm now_tm = *std::localtime(&now_time_t);
+        
+        std::ostringstream oss;
+        oss << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << '.' << std::setw(3) << std::setfill('0') << milliseconds.count();
+        oss << " [Thread ID: " << std::this_thread::get_id() << "] " << message << std::endl;
+
+        log_file_ << oss.str();
+        log_file_.flush();
+    }
+
+private:
+    std::string log_file_path_;
+    std::ofstream log_file_;
+    std::mutex log_mutex_;
+};
+
+WriterThreadLogger thread_writer_logger;
 
 WriteThread::WriteThread(const ImmutableDBOptions& db_options)
     : max_yield_usec_(db_options.enable_write_thread_adaptive_yield
@@ -39,6 +88,7 @@ uint8_t WriteThread::BlockingAwaitState(Writer* w, uint8_t goal_mask) {
   // STATE_LOCKED_WAITING state.  The waker won't try to touch the mutex
   // or the condvar unless they CAS away the STATE_LOCKED_WAITING that
   // we install below.
+  thread_writer_logger.log(std::string("BlockingAwaitState 1"));
   w->CreateMutex();
 
   auto state = w->state.load(std::memory_order_acquire);
@@ -48,6 +98,7 @@ uint8_t WriteThread::BlockingAwaitState(Writer* w, uint8_t goal_mask) {
     // we have permission (and an obligation) to use StateMutex
     std::unique_lock<std::mutex> guard(w->StateMutex());
     w->StateCV().wait(guard, [w] {
+      thread_writer_logger.log(std::string("BlockingAwaitState 2"));
       return w->state.load(std::memory_order_relaxed) != STATE_LOCKED_WAITING;
     });
     state = w->state.load(std::memory_order_relaxed);
@@ -58,6 +109,7 @@ uint8_t WriteThread::BlockingAwaitState(Writer* w, uint8_t goal_mask) {
   // waits for a transition across intermediate states, so we know that
   // since a state change has occurred the goal must have been met.
   assert((state & goal_mask) != 0);
+  thread_writer_logger.log(std::string("BlockingAwaitState 3"));
   return state;
 }
 
@@ -73,14 +125,16 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
   // is the effect of the pause instruction), so 200 iterations is a bit
   // more than a microsecond.  This is long enough that waits longer than
   // this can amortize the cost of accessing the clock and yielding.
+  thread_writer_logger.log(std::string("AwaitState 1"));
   for (uint32_t tries = 0; tries < 200; ++tries) {
     state = w->state.load(std::memory_order_acquire);
     if ((state & goal_mask) != 0) {
+      thread_writer_logger.log(std::string("AwaitState 2"));
       return state;
     }
     port::AsmVolatilePause();
   }
-
+  thread_writer_logger.log(std::string("AwaitState 3"));
   // This is below the fast path, so that the stat is zero when all writes are
   // from the same thread.
   PERF_TIMER_GUARD(write_thread_wait_nanos);
@@ -140,7 +194,7 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
   // The samling base for updating the yeild credit. The sampling rate would be
   // 1/sampling_base.
   const int sampling_base = 256;
-
+  thread_writer_logger.log(std::string("AwaitState 4"));
   if (max_yield_usec_ > 0) {
     update_ctx = Random::GetTLSInstance()->OneIn(sampling_base);
 
@@ -155,6 +209,7 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
       size_t slow_yield_count = 0;
 
       auto iter_begin = spin_begin;
+      thread_writer_logger.log(std::string("AwaitState while 1"));
       while ((iter_begin - spin_begin) <=
              std::chrono::microseconds(max_yield_usec_)) {
         std::this_thread::yield();
@@ -181,14 +236,15 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
         }
         iter_begin = now;
       }
+      thread_writer_logger.log(std::string("AwaitState while 2"));
     }
   }
-
+  thread_writer_logger.log(std::string("AwaitState 5"));
   if ((state & goal_mask) == 0) {
     TEST_SYNC_POINT_CALLBACK("WriteThread::AwaitState:BlockingWaiting", w);
     state = BlockingAwaitState(w, goal_mask);
   }
-
+  thread_writer_logger.log(std::string("AwaitState 6"));
   if (update_ctx) {
     // Since our update is sample based, it is ok if a thread overwrites the
     // updates by other threads. Thus the update does not have to be atomic.
@@ -211,6 +267,7 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
 
 void WriteThread::SetState(Writer* w, uint8_t new_state) {
   assert(w);
+   thread_writer_logger.log(std::string("SetState 1"));
   auto state = w->state.load(std::memory_order_acquire);
   if (state == STATE_LOCKED_WAITING ||
       !w->state.compare_exchange_strong(state, new_state)) {
@@ -221,13 +278,17 @@ void WriteThread::SetState(Writer* w, uint8_t new_state) {
     w->state.store(new_state, std::memory_order_relaxed);
     w->StateCV().notify_one();
   }
+  thread_writer_logger.log(std::string("SetState 2"));
 }
 
 bool WriteThread::LinkOne(Writer* w, std::atomic<Writer*>* newest_writer) {
   assert(newest_writer != nullptr);
   assert(w->state == STATE_INIT);
+  thread_writer_logger.log(std::string("LinkOne 1"));
   Writer* writers = newest_writer->load(std::memory_order_relaxed);
+   thread_writer_logger.log(std::string("LinkOne 2"));
   while (true) {
+    thread_writer_logger.log(std::string("while 1"));
     assert(writers != w);
     // If write stall in effect, and w->no_slowdown is not true,
     // block here until stall is cleared. If its true, then return
@@ -241,22 +302,30 @@ bool WriteThread::LinkOne(Writer* w, std::atomic<Writer*>* newest_writer) {
       // Since no_slowdown is false, wait here to be notified of the write
       // stall clearing
       {
+        thread_writer_logger.log(std::string("LinkOne MutexLock 1"));
         MutexLock lock(&stall_mu_);
         writers = newest_writer->load(std::memory_order_relaxed);
+        thread_writer_logger.log(std::string("LinkOne MutexLock 2"));
         if (writers == &write_stall_dummy_) {
+          thread_writer_logger.log(std::string("LinkOne MutexLock 3"));
           TEST_SYNC_POINT_CALLBACK("WriteThread::WriteStall::Wait", w);
           stall_cv_.Wait();
           // Load newest_writers_ again since it may have changed
           writers = newest_writer->load(std::memory_order_relaxed);
           continue;
         }
+        thread_writer_logger.log(std::string("LinkOne MutexLock 4"));
       }
     }
     w->link_older = writers;
+    thread_writer_logger.log(std::string("while 2"));
     if (newest_writer->compare_exchange_weak(writers, w)) {
+      thread_writer_logger.log(std::string("while 3"));
       return (writers == nullptr);
     }
+    thread_writer_logger.log(std::string("while 4"));
   }
+   thread_writer_logger.log(std::string("LinkOne 3"));
 }
 
 bool WriteThread::LinkGroup(WriteGroup& write_group,
@@ -399,13 +468,17 @@ void WriteThread::WaitForStallEndedCount(uint64_t stall_count) {
 
 static WriteThread::AdaptationContext jbg_ctx("JoinBatchGroup");
 void WriteThread::JoinBatchGroup(Writer* w) {
+  thread_writer_logger.log(std::string("JoinBatchGroup 1"));
   TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Start", w);
   assert(w->batch != nullptr);
-
+  thread_writer_logger.log(std::string("JoinBatchGroup 2"));
   bool linked_as_leader = LinkOne(w, &newest_writer_);
+  thread_writer_logger.log(std::string("JoinBatchGroup 3"));
 
   if (linked_as_leader) {
+    thread_writer_logger.log(std::string("JoinBatchGroup 4"));
     SetState(w, STATE_GROUP_LEADER);
+    thread_writer_logger.log(std::string("JoinBatchGroup 5"));
   }
 
   TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Wait", w);
@@ -426,10 +499,12 @@ void WriteThread::JoinBatchGroup(Writer* w) {
      *      writes in parallel.
      */
     TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:BeganWaiting", w);
+    thread_writer_logger.log(std::string("JoinBatchGroup 6"));
     AwaitState(w,
                STATE_GROUP_LEADER | STATE_MEMTABLE_WRITER_LEADER |
                    STATE_PARALLEL_MEMTABLE_WRITER | STATE_COMPLETED,
                &jbg_ctx);
+    thread_writer_logger.log(std::string("JoinBatchGroup 7"));
     TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:DoneWaiting", w);
   }
 }
